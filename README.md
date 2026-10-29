@@ -23,9 +23,10 @@ status live as the run executes.
 - **Join barrier**: a task becomes `ready` only when **every** dependency has `succeeded`.
 - **Retries with exponential backoff**: 2 s → 4 s → 8s …, capped at 60 s. A task waiting for a retry blocks its dependents.
 - **Fail-fast**: after a terminal failure the run fails and every not-yet-started task is `skipped`.
-  In-flight tasks may finish, but the outcome stays `failed`.
+  In-flight tasks may finish, but the outcome stays `failed`, and an in-flight task that then fails is not retried.
 - **Cancellation**: pending and ready tasks become `cancelled`, and running tasks are interrupted. Cancel wins any race.
 - **Restart recovery**: on boot, any task left `running` by a dead process is retried (or failed if out of attempts).
+  The same sweep repeats every `ORPHAN_SWEEP_MS` for tasks whose worker could not save its outcome (e.g. a DB outage).
 - **Every transition is a compare-and-set** in PostgreSQL. In-memory futures are never the source of truth.
 
 ## Architecture
@@ -110,7 +111,12 @@ On a Colima host, export the socket first:
 | `MAX_CONCURRENT_TASKS` | `4` | executor threads |
 | `RETRY_BASE_MS` / `RETRY_MAX_MS` | `2000` / `60000` | backoff = base·2^(attempt−1), capped |
 | `SCHEDULER_TICK_MS` | `200` | scheduler loop interval |
-| `API_KEY` | *(empty)* | if set, all `POST /api/**` need `X-API-Key` (the UI prompts for it) |
+| `ORPHAN_SWEEP_MS` | `15000` | how often tasks left `running` with no live worker (e.g. outcome lost during a DB outage) are recovered |
+| `DB_POOL_SIZE` | `10` | JDBC connection pool size |
+| `API_KEY` | *(empty)* | if set, all `POST /api/**` except the dry-run `/api/workflows/validate` need `X-API-Key` (the UI prompts for it) |
+
+All settings are optional. `docker compose` reads overrides from a `.env` file (see `.env.example`); Spring Boot
+does not, so export them for `./mvnw spring-boot:run`.
 | `SEED_DEMO_DATA` | `true` | seed demo workflows on startup |
 
 ## API

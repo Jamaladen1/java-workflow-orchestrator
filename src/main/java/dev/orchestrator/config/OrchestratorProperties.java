@@ -10,11 +10,13 @@ public record OrchestratorProperties(
         long retryMaxMs,
         String apiKey,
         boolean seedDemoData,
-        int maxDefinitionBytes) {
+        int maxDefinitionBytes,
+        long orphanSweepIntervalMs) {
 
     public OrchestratorProperties {
         if (maxConcurrentTasks <= 0) maxConcurrentTasks = 4;
         if (tickIntervalMs <= 0) tickIntervalMs = 200;
+        if (orphanSweepIntervalMs <= 0) orphanSweepIntervalMs = 15000;
         if (retryBaseMs <= 0) retryBaseMs = 2000;
         if (retryMaxMs <= 0) retryMaxMs = 60000;
         if (maxDefinitionBytes <= 0) maxDefinitionBytes = 65536;

@@ -1,5 +1,6 @@
 package dev.orchestrator.scheduler;
 
+import dev.orchestrator.config.OrchestratorProperties;
 import dev.orchestrator.persistence.TaskRunEntity;
 import dev.orchestrator.persistence.TaskRunRepository;
 import dev.orchestrator.persistence.WorkflowRunRepository;
@@ -24,14 +25,17 @@ public class WorkflowScheduler {
     private final TaskRunRepository tasks;
     private final RunStateService state;
     private final TaskDispatcher dispatcher;
+    private final long orphanSweepIntervalMs;
     private volatile boolean started;
+    private long lastOrphanSweep;
 
     public WorkflowScheduler(WorkflowRunRepository runs, TaskRunRepository tasks, RunStateService state,
-                             TaskDispatcher dispatcher) {
+                             TaskDispatcher dispatcher, OrchestratorProperties props) {
         this.runs = runs;
         this.tasks = tasks;
         this.state = state;
         this.dispatcher = dispatcher;
+        this.orphanSweepIntervalMs = props.orphanSweepIntervalMs();
     }
 
     @EventListener(ApplicationReadyEvent.class)
@@ -41,13 +45,17 @@ public class WorkflowScheduler {
         started = true;
     }
 
-    /** Any 'running' row with no live executor thread in this JVM is an orphan from a previous process. */
+    /**
+     * Any 'running' row with no live executor thread in this JVM is an orphan: left by a previous process, or by a
+     * worker that could not persist its outcome (e.g. during a database outage). Runs under the tick lock, so a task
+     * is never seen between its claim and its registration with the dispatcher.
+     */
     public synchronized int recoverOrphanedTasks() {
+        lastOrphanSweep = System.currentTimeMillis();
         int n = 0;
         for (TaskRunEntity t : tasks.findAllRunning()) {
             if (dispatcher.isRunningLocally(t.getId())) continue;
-            state.recoverOrphan(t);
-            n++;
+            if (state.recoverOrphan(t)) n++;
         }
         return n;
     }
@@ -60,6 +68,14 @@ public class WorkflowScheduler {
                 state.evaluateRun(runId);
             } catch (Exception e) {
                 log.warn("failed to evaluate run {}: {}", runId, e.toString());
+            }
+        }
+        if (System.currentTimeMillis() - lastOrphanSweep >= orphanSweepIntervalMs) {
+            try {
+                int n = recoverOrphanedTasks();
+                if (n > 0) log.warn("recovered {} orphaned running task(s) with no live worker", n);
+            } catch (Exception e) {
+                log.warn("orphan sweep failed: {}", e.toString());
             }
         }
         try {

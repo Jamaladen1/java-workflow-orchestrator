@@ -2,7 +2,6 @@ package dev.orchestrator.api;
 
 import dev.orchestrator.api.Dtos.*;
 import dev.orchestrator.persistence.*;
-import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -30,10 +29,10 @@ public class RunQueryService {
 
     public List<RunSummary> listRuns(UUID definitionId, int limit, int offset) {
         int size = Math.max(1, Math.min(limit, 100));
-        int page = Math.max(0, offset) / size;
+        int from = Math.max(0, offset);
         List<WorkflowRunEntity> rows = definitionId == null
-                ? runs.findAllByOrderByCreatedAtDesc(PageRequest.of(page, size))
-                : runs.findByWorkflowDefinitionIdOrderByCreatedAtDesc(definitionId, PageRequest.of(page, size));
+                ? runs.page(size, from)
+                : runs.pageByDefinition(definitionId, size, from);
         Map<UUID, WorkflowDefinitionEntity> defs = definitions.findAllById(
                 rows.stream().map(WorkflowRunEntity::getWorkflowDefinitionId).collect(Collectors.toSet()))
                 .stream().collect(Collectors.toMap(WorkflowDefinitionEntity::getId, Function.identity()));
