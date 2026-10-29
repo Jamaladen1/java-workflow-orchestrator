@@ -173,6 +173,19 @@ while the branches are running. On boot the log shows `recovered 2 orphaned runn
 (`attempts=2`), and the run still succeeds.
 
 ## Deployment (hosted)
+
+### Free deploy: Render + Neon ($0)
+
+`render.yaml` deploys the UI, API and scheduler as one free Render web service.
+`DATABASE_URL` accepts a provider-style `postgresql://user:pass@host/db?sslmode=require`
+URL (it's converted to JDBC on startup), and `JAVA_TOOL_OPTIONS` caps the heap so the
+app fits in 512 MB (it uses ~190 MB).
+
+1. Create a free Neon database and copy its **direct** (not pooled) connection string.
+2. In Render: **New → Blueprint**, pick this repo, and paste the string as `DATABASE_URL`.
+3. Free instances sleep after ~15 min idle, so the first request takes ~30–60s.
+   Runs interrupted by sleep are recovered on wake by the restart-recovery path.
+
 1. Provision managed PostgreSQL 14+ (Neon, Supabase, RDS, Cloud SQL, …).
 2. Build and push the image: `docker build -t <registry>/workflow-orchestrator . && docker push …`
 3. Run **one** instance (the scheduler is single-node) on Fly.io, Render, Railway, Cloud Run (min=max=1 instances), ECS, etc., with

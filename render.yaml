@@ -1,0 +1,20 @@
+# Render Blueprint: free-tier deploy (UI + API + scheduler in one container).
+# Postgres is external (e.g. Neon free tier). Paste its postgres:// connection
+# string as DATABASE_URL in the Render dashboard when prompted; never committed.
+services:
+  - type: web
+    name: java-workflow-orchestrator
+    runtime: docker
+    plan: free
+    healthCheckPath: /health/ready
+    autoDeploy: true
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      - key: DB_POOL_SIZE
+        value: "5"
+      - key: SCHEDULER_TICK_MS
+        value: "500"
+      # Fit Spring Boot into the 512 MB free instance.
+      - key: JAVA_TOOL_OPTIONS
+        value: "-Xmx256m -Xss512k -XX:MaxMetaspaceSize=128m -XX:+UseSerialGC -XX:TieredStopAtLevel=1"
