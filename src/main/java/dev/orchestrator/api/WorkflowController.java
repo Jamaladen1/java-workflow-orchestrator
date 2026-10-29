@@ -42,7 +42,7 @@ public class WorkflowController {
     }
 
     @PostMapping(consumes = "application/json")
-    public ResponseEntity<?> create(@RequestBody String body) {
+    public ResponseEntity<?> create(@RequestBody(required = false) String body) {
         JsonNode raw = parse(body);
         WorkflowService.SaveResult r = service.save(raw);
         if (!r.validation().isValid()) {
@@ -55,7 +55,7 @@ public class WorkflowController {
 
     /** Dry-run validation used by the editor; never persists. */
     @PostMapping(path = "/validate", consumes = "application/json")
-    public ResponseEntity<?> validate(@RequestBody String body) {
+    public ResponseEntity<?> validate(@RequestBody(required = false) String body) {
         ValidationResult r = validator.validate(parse(body));
         if (!r.isValid()) {
             return ResponseEntity.unprocessableEntity().body(new ValidationFailure("workflow definition is invalid", r.errors()));

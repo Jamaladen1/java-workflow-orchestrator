@@ -14,9 +14,13 @@ import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.testcontainers.containers.PostgreSQLContainer;
 
+import javax.sql.DataSource;
+import java.sql.Connection;
+import java.sql.PreparedStatement;
 import java.time.Duration;
 import java.time.OffsetDateTime;
 import java.util.*;
+import java.util.concurrent.*;
 import java.util.stream.StreamSupport;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -26,7 +30,9 @@ import static org.awaitility.Awaitility.await;
         "orchestrator.tick-interval-ms=50",
         "orchestrator.retry-base-ms=200",
         "orchestrator.seed-demo-data=false",
-        "orchestrator.max-concurrent-tasks=4"
+        "orchestrator.max-concurrent-tasks=4",
+        // the restart-recovery tests below drive recovery explicitly
+        "orchestrator.orphan-sweep-interval-ms=3600000"
 })
 class OrchestratorIT {
 
@@ -41,6 +47,7 @@ class OrchestratorIT {
     @Autowired WorkflowScheduler scheduler;
     @Autowired TaskRunRepository taskRuns;
     @Autowired TransactionTemplate tx;
+    @Autowired DataSource dataSource;
 
     // ---------- helpers ----------
 
@@ -220,15 +227,17 @@ class OrchestratorIT {
                 {"name":"it-cas","tasks":[{"id":"a","type":"delay","config":{"duration_ms":1}}]}""");
         UUID runId = UUID.randomUUID();
         UUID taskId = UUID.randomUUID();
-        // A terminal run is ignored by the scheduler, so only this test touches the task.
-        jdbc.update("INSERT INTO workflow_runs(id, workflow_definition_id, status) VALUES (?,?, 'cancelled')", runId, wf);
-        jdbc.update("INSERT INTO task_runs(id, workflow_run_id, task_key, task_type, config, status, max_attempts) "
-                + "VALUES (?,?,'a','delay','{}'::jsonb,'ready',3)", taskId, runId);
-        assertThat((Integer) tx.execute(st -> taskRuns.claim(taskId))).isEqualTo(1);
-        assertThat((Integer) tx.execute(st -> taskRuns.claim(taskId))).isZero();            // no duplicate dispatch
-        assertThat((Integer) tx.execute(st -> taskRuns.completeSuccess(taskId, "{}"))).isEqualTo(1);
-        assertThat((Integer) tx.execute(st -> taskRuns.completeSuccess(taskId, "{}"))).isZero(); // idempotent completion
-        assertThat((Integer) tx.execute(st -> taskRuns.failTerminal(taskId, "late"))).isZero();  // cannot overwrite a terminal state
+        synchronized (scheduler) { // no scheduler tick touches this run while the test drives it
+            jdbc.update("INSERT INTO workflow_runs(id, workflow_definition_id, status) VALUES (?,?, 'running')", runId, wf);
+            jdbc.update("INSERT INTO task_runs(id, workflow_run_id, task_key, task_type, config, status, max_attempts) "
+                    + "VALUES (?,?,'a','delay','{}'::jsonb,'ready',3)", taskId, runId);
+            assertThat((Integer) tx.execute(st -> taskRuns.claim(taskId))).isEqualTo(1);
+            assertThat((Integer) tx.execute(st -> taskRuns.claim(taskId))).isZero();            // no duplicate dispatch
+            assertThat((Integer) tx.execute(st -> taskRuns.completeSuccess(taskId, "{}"))).isEqualTo(1);
+            assertThat((Integer) tx.execute(st -> taskRuns.completeSuccess(taskId, "{}"))).isZero(); // idempotent completion
+            assertThat((Integer) tx.execute(st -> taskRuns.failTerminal(taskId, "late"))).isZero();  // cannot overwrite a terminal state
+            jdbc.update("UPDATE workflow_runs SET status='succeeded' WHERE id=?", runId);
+        }
         assertThat(jdbc.queryForObject("SELECT attempts FROM task_runs WHERE id=?", Integer.class, taskId)).isEqualTo(1);
     }
 
@@ -254,5 +263,183 @@ class OrchestratorIT {
         assertThat(post("/api/workflows", def).getBody().get("version").asInt()).isEqualTo(2);
 
         assertThat(http.getForEntity("/health/ready", JsonNode.class).getStatusCode()).isEqualTo(HttpStatus.OK);
+    }
+
+    @Test
+    void retryableTaskStillRunningWhenRunFailsIsNotLeftWaitingForRetry() {
+        UUID wf = createWorkflow("""
+                {"name":"it-failfast-inflight-retry","tasks":[
+                  {"id":"bad","type":"math","config":{"operation":"fail"},"max_attempts":1},
+                  {"id":"slow","type":"delay","config":{"duration_ms":1000,"fail_until_attempt":2},"max_attempts":3}]}""");
+        UUID runId = startRun(wf);
+        awaitStatus(runId, "failed", 10);
+        await().atMost(Duration.ofSeconds(10))
+                .until(() -> !tasksByKey(run(runId)).get("slow").get("status").asText().equals("running"));
+        // past the 200 ms retry backoff: nothing may be re-dispatched inside a terminal run
+        await().pollDelay(Duration.ofMillis(800)).atMost(Duration.ofSeconds(2)).until(() -> true);
+        JsonNode r = run(runId);
+        Map<String, JsonNode> t = tasksByKey(r);
+        assertThat(r.get("status").asText()).isEqualTo("failed");
+        assertThat(t.get("slow").get("status").asText()).isEqualTo("failed");
+        assertThat(t.get("slow").get("attempts").asInt()).isEqualTo(1);
+        r.get("tasks").forEach(task -> assertThat(task.get("status").asText()).isNotIn("pending", "ready", "running"));
+    }
+
+    @Test
+    void cancelRacingWithClaimStillCancelsTheClaimedTask() throws Exception {
+        UUID wf = createWorkflow("""
+                {"name":"it-cancel-claim-race","tasks":[{"id":"a","type":"delay","config":{"duration_ms":50}}]}""");
+        UUID runId = UUID.randomUUID();
+        UUID taskId = UUID.randomUUID();
+        synchronized (scheduler) { // keeps scheduler ticks out of this run while the race is staged
+            jdbc.update("INSERT INTO workflow_runs(id, workflow_definition_id, status, started_at) VALUES (?,?, 'running', now())", runId, wf);
+            jdbc.update("INSERT INTO task_runs(id, workflow_run_id, task_key, task_type, config, status, max_attempts) "
+                    + "VALUES (?,?,'a','delay','{\"duration_ms\":50}'::jsonb,'ready',3)", taskId, runId);
+            try (Connection claimer = dataSource.getConnection()) {
+                claimer.setAutoCommit(false);
+                // A dispatcher claim that is in flight (row locked, not yet committed) when the cancel arrives.
+                try (PreparedStatement ps = claimer.prepareStatement(
+                        "UPDATE task_runs SET status='running', attempts=attempts+1, started_at=now() WHERE id=? AND status='ready'")) {
+                    ps.setObject(1, taskId);
+                    assertThat(ps.executeUpdate()).isEqualTo(1);
+                }
+                CompletableFuture<ResponseEntity<JsonNode>> cancel =
+                        CompletableFuture.supplyAsync(() -> post("/api/runs/" + runId + "/cancel", ""));
+                await().atMost(Duration.ofSeconds(5)).until(() -> jdbc.queryForObject(
+                        "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock'", Integer.class) > 0);
+                claimer.commit();
+                assertThat(cancel.get(10, TimeUnit.SECONDS).getStatusCode()).isEqualTo(HttpStatus.ACCEPTED);
+            }
+        }
+        assertThat(jdbc.queryForObject("SELECT status FROM task_runs WHERE id=?", String.class, taskId)).isEqualTo("cancelled");
+    }
+
+    @Test
+    void claimIsRefusedOnceTheRunIsNoLongerRunning() {
+        UUID wf = createWorkflow("""
+                {"name":"it-claim-guard","tasks":[{"id":"a","type":"delay","config":{"duration_ms":1}}]}""");
+        UUID runId = UUID.randomUUID();
+        UUID taskId = UUID.randomUUID();
+        jdbc.update("INSERT INTO workflow_runs(id, workflow_definition_id, status) VALUES (?,?, 'failed')", runId, wf);
+        jdbc.update("INSERT INTO task_runs(id, workflow_run_id, task_key, task_type, config, status, max_attempts) "
+                + "VALUES (?,?,'a','delay','{}'::jsonb,'ready',3)", taskId, runId);
+        assertThat((Integer) tx.execute(st -> taskRuns.claim(taskId))).isZero();
+        assertThat(jdbc.queryForObject("SELECT attempts FROM task_runs WHERE id=?", Integer.class, taskId)).isZero();
+    }
+
+    @Test
+    void runHistoryPaginationHonoursArbitraryOffsets() {
+        UUID wf = createWorkflow("""
+                {"name":"it-pagination","tasks":[{"id":"a","type":"delay","config":{"duration_ms":1}}]}""");
+        for (int i = 0; i < 5; i++) startRun(wf);
+        List<String> all = ids(http.getForObject("/api/workflows/" + wf + "/runs?limit=10", JsonNode.class));
+        assertThat(all).hasSize(5);
+        assertThat(ids(http.getForObject("/api/workflows/" + wf + "/runs?limit=2&offset=1", JsonNode.class)))
+                .containsExactly(all.get(1), all.get(2));
+        assertThat(ids(http.getForObject("/api/runs?workflowId=" + wf + "&limit=3&offset=3", JsonNode.class)))
+                .containsExactly(all.get(3), all.get(4));
+    }
+
+    @Test
+    void httpTaskSucceedsOn2xxAndFailsOnErrorStatus() {
+        UUID wf = createWorkflow("""
+                {"name":"it-http","tasks":[
+                  {"id":"ok","type":"http","config":{"status":200,"delay_ms":50}},
+                  {"id":"err","type":"http","config":{"status":503},"max_attempts":1,"depends_on":["ok"]}]}""");
+        UUID runId = startRun(wf);
+        Map<String, JsonNode> t = tasksByKey(awaitStatus(runId, "failed", 15));
+        assertThat(t.get("ok").get("status").asText()).isEqualTo("succeeded");
+        assertThat(t.get("ok").get("result").get("http_status").asInt()).isEqualTo(200);
+        assertThat(t.get("err").get("status").asText()).isEqualTo("failed");
+        assertThat(t.get("err").get("last_error").asText()).contains("HTTP 503");
+    }
+
+    @Test
+    void concurrentRunsStayWithinExecutorBoundWithoutDuplicateDispatch() {
+        UUID wf = createWorkflow("""
+                {"name":"it-concurrency","tasks":[
+                  {"id":"a","type":"delay","config":{"duration_ms":150}},
+                  {"id":"b","type":"delay","config":{"duration_ms":150}},
+                  {"id":"c","type":"delay","config":{"duration_ms":150}},
+                  {"id":"d","type":"math","config":{"operation":"max","values":[1,9]},"depends_on":["a","b","c"]}]}""");
+        List<UUID> runIds = parallel(10, () -> startRun(wf));
+        for (UUID runId : runIds) {
+            Map<String, JsonNode> t = tasksByKey(awaitStatus(runId, "succeeded", 30));
+            t.values().forEach(task -> assertThat(task.get("attempts").asInt()).isEqualTo(1));
+            for (String key : t.keySet()) assertThat(eventTypes(runId, key)).filteredOn("task_started"::equals).hasSize(1);
+        }
+        JsonNode m = http.getForObject("/api/metrics", JsonNode.class);
+        assertThat(m.get("peak_concurrency").asInt()).isBetween(2, m.get("max_concurrent_tasks").asInt());
+    }
+
+    @Test
+    void concurrentCancelsAcceptExactlyOne() {
+        UUID wf = createWorkflow("""
+                {"name":"it-cancel-concurrent","tasks":[{"id":"long","type":"delay","config":{"duration_ms":3000}}]}""");
+        UUID runId = startRun(wf);
+        List<HttpStatusCode> codes = parallel(8, () -> post("/api/runs/" + runId + "/cancel", "").getStatusCode());
+        assertThat(codes).filteredOn(HttpStatus.ACCEPTED::equals).hasSize(1);
+        assertThat(codes).filteredOn(HttpStatus.CONFLICT::equals).hasSize(7);
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM task_events WHERE workflow_run_id=? AND type='run_cancelled'",
+                Integer.class, runId)).isEqualTo(1);
+    }
+
+    @Test
+    void concurrentSavesOfOneNameNeverDuplicateAVersion() {
+        String def = "{\"name\":\"it-concurrent-save\",\"tasks\":[{\"id\":\"a\",\"type\":\"delay\",\"config\":{\"duration_ms\":1}}]}";
+        List<ResponseEntity<JsonNode>> res = parallel(10, () -> post("/api/workflows", def));
+        assertThat(res).allMatch(r -> r.getStatusCode().equals(HttpStatus.CREATED) || r.getStatusCode().equals(HttpStatus.CONFLICT));
+        List<Integer> versions = res.stream().filter(r -> r.getStatusCode().equals(HttpStatus.CREATED))
+                .map(r -> r.getBody().get("version").asInt()).sorted().toList();
+        assertThat(versions).isNotEmpty().doesNotHaveDuplicates();
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM workflow_definitions WHERE name='it-concurrent-save'",
+                Integer.class)).isEqualTo(versions.size());
+    }
+
+    @Test
+    void readEndpointsAndRequestEdgeCases() {
+        String def = "{\"name\":\"it-read\",\"tasks\":[{\"id\":\"a\",\"type\":\"transform\",\"config\":{\"operation\":\"reverse\",\"input\":\"abc\"}}]}";
+        assertThat(post("/api/workflows/validate", def).getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(jdbc.queryForObject("SELECT count(*) FROM workflow_definitions WHERE name='it-read'", Integer.class)).isZero();
+
+        UUID wf = createWorkflow(def);
+        JsonNode detail = http.getForObject("/api/workflows/" + wf, JsonNode.class);
+        assertThat(detail.get("definition").get("tasks").get(0).get("id").asText()).isEqualTo("a");
+        JsonNode list = http.getForObject("/api/workflows", JsonNode.class);
+        assertThat(StreamSupport.stream(list.spliterator(), false).anyMatch(w -> w.get("id").asText().equals(wf.toString()))).isTrue();
+
+        UUID runId = startRun(wf);
+        JsonNode r = awaitStatus(runId, "succeeded", 10);
+        assertThat(r.get("tasks").get(0).get("result").get("value").asText()).isEqualTo("cba");
+        assertThat(eventTypes(runId, null)).startsWith("run_created", "run_started").endsWith("run_succeeded");
+
+        ResponseEntity<JsonNode> empty = post("/api/workflows", "");
+        assertThat(empty.getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(empty.getBody().get("error").asText()).isEqualTo("request body is required");
+        assertThat(post("/api/workflows", "{\"name\":\"x\",\"pad\":\"" + "x".repeat(70_000) + "\"}").getStatusCode())
+                .isEqualTo(HttpStatus.PAYLOAD_TOO_LARGE);
+        assertThat(http.getForEntity("/api/runs/not-a-uuid", JsonNode.class).getStatusCode()).isEqualTo(HttpStatus.BAD_REQUEST);
+        assertThat(post("/api/workflows/" + UUID.randomUUID() + "/runs", "").getStatusCode()).isEqualTo(HttpStatus.NOT_FOUND);
+    }
+
+    private static List<String> ids(JsonNode arr) {
+        return StreamSupport.stream(arr.spliterator(), false).map(n -> n.get("id").asText()).toList();
+    }
+
+    private static <T> List<T> parallel(int n, Callable<T> call) {
+        ExecutorService pool = Executors.newFixedThreadPool(n);
+        try {
+            CountDownLatch go = new CountDownLatch(1);
+            List<Future<T>> fs = new ArrayList<>();
+            for (int i = 0; i < n; i++) fs.add(pool.submit(() -> { go.await(); return call.call(); }));
+            go.countDown();
+            List<T> out = new ArrayList<>();
+            for (Future<T> f : fs) out.add(f.get(30, TimeUnit.SECONDS));
+            return out;
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        } finally {
+            pool.shutdownNow();
+        }
     }
 }

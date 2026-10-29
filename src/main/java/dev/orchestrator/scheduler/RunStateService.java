@@ -58,9 +58,9 @@ public class RunStateService {
     /** Re-evaluates one run: start it, promote ready tasks, apply fail-fast, or finish it. */
     @Transactional
     public void evaluateRun(UUID runId) {
-        WorkflowRunEntity run = runs.findById(runId).orElse(null);
-        if (run == null || RunStatus.of(run.getStatus()).isTerminal()) return;
-        if (RunStatus.of(run.getStatus()) == RunStatus.PENDING && runs.markRunning(runId) == 1) {
+        RunStatus status = runs.lockStatus(runId).map(RunStatus::of).orElse(null);
+        if (status == null || status.isTerminal()) return;
+        if (status == RunStatus.PENDING && runs.markRunning(runId) == 1) {
             events.record(runId, null, "run_started", Map.of());
         }
         List<TaskRunEntity> taskRows = tasks.findByWorkflowRunIdOrderByTaskKey(runId);
@@ -115,11 +115,18 @@ public class RunStateService {
         return false;
     }
 
-    /** running -> ready (retry with backoff) or running -> failed when attempts are exhausted. */
+    /**
+     * running -> ready (retry with backoff) or running -> failed when attempts are exhausted. A run that has already
+     * finished (fail-fast) never gets a retry: nothing would dispatch it, so the task fails instead.
+     */
     @Transactional
     public boolean recordFailure(TaskRunEntity t, String error, long durationMs) {
         String err = error == null ? "unknown error" : (error.length() > 2000 ? error.substring(0, 2000) : error);
-        if (retryPolicy.canRetry(t.getAttempts(), t.getMaxAttempts())) {
+        RunStatus runStatus = runs.lockStatus(t.getWorkflowRunId()).map(RunStatus::of).orElse(RunStatus.FAILED);
+        if (runStatus.isTerminal() && retryPolicy.canRetry(t.getAttempts(), t.getMaxAttempts())) {
+            err = err + " (not retried: run already " + runStatus.db() + ")";
+        }
+        if (!runStatus.isTerminal() && retryPolicy.canRetry(t.getAttempts(), t.getMaxAttempts())) {
             long backoff = retryPolicy.backoffMs(t.getAttempts());
             if (tasks.scheduleRetry(t.getId(), err, backoff) == 1) {
                 events.record(t.getWorkflowRunId(), t.getId(), "task_retry_scheduled",
@@ -156,12 +163,12 @@ public class RunStateService {
         if (runs.finish(runId, RunStatus.CANCELLED.db()) != 1) return new Cancellation(CancelResult.ALREADY_TERMINAL, List.of());
         List<UUID> running = new ArrayList<>();
         for (TaskRunEntity t : tasks.findByWorkflowRunIdOrderByTaskKey(runId)) {
-            TaskStatus s = TaskStatus.of(t.getStatus());
-            if ((s == TaskStatus.PENDING || s == TaskStatus.READY)
-                    && tasks.markNotStarted(t.getId(), TaskStatus.CANCELLED.db(), "run cancelled") == 1) {
+            // The snapshot may be stale (a claim can commit ready->running after it was read), so let each CAS
+            // decide instead of branching on the status read above.
+            if (TaskStatus.of(t.getStatus()).isTerminal()) continue;
+            if (tasks.markNotStarted(t.getId(), TaskStatus.CANCELLED.db(), "run cancelled") == 1) {
                 events.record(runId, t.getId(), "task_cancelled", Map.of("task", t.getTaskKey()));
-            } else if (s == TaskStatus.RUNNING
-                    && tasks.cancelRunning(t.getId(), "run cancelled while running (interrupt requested)") == 1) {
+            } else if (tasks.cancelRunning(t.getId(), "run cancelled while running (interrupt requested)") == 1) {
                 running.add(t.getId());
                 events.record(runId, t.getId(), "task_cancelled",
                         Map.of("task", t.getTaskKey(), "interrupt_requested", true));
@@ -177,26 +184,34 @@ public class RunStateService {
      * attempts remain, otherwise fail it terminally (fail-fast then applies on the next tick).
      */
     @Transactional
-    public void recoverOrphan(TaskRunEntity t) {
-        RunStatus runStatus = runs.findById(t.getWorkflowRunId()).map(r -> RunStatus.of(r.getStatus())).orElse(RunStatus.FAILED);
+    public boolean recoverOrphan(TaskRunEntity t) {
+        RunStatus runStatus = runs.lockStatus(t.getWorkflowRunId()).map(RunStatus::of).orElse(RunStatus.FAILED);
+        boolean recovered;
         if (runStatus.isTerminal()) {
-            if (tasks.cancelRunning(t.getId(), "orphaned by restart; run already " + runStatus.db()) == 1) {
+            recovered = tasks.cancelRunning(t.getId(), "orphaned task (no live worker); run already " + runStatus.db()) == 1;
+            if (recovered) {
                 events.record(t.getWorkflowRunId(), t.getId(), "task_recovered",
                         Map.of("task", t.getTaskKey(), "action", "cancelled"));
             }
-            return;
-        }
-        String reason = "orchestrator restarted while task was running (attempt " + t.getAttempts() + ")";
-        if (retryPolicy.canRetry(t.getAttempts(), t.getMaxAttempts())) {
-            long backoff = retryPolicy.backoffMs(t.getAttempts());
-            if (tasks.scheduleRetry(t.getId(), reason, backoff) == 1) {
-                events.record(t.getWorkflowRunId(), t.getId(), "task_recovered",
-                        Map.of("task", t.getTaskKey(), "action", "retry", "backoff_ms", backoff));
+        } else {
+            String reason = "task orphaned while running (attempt " + t.getAttempts()
+                    + "): orchestrator restarted or its outcome could not be saved";
+            if (retryPolicy.canRetry(t.getAttempts(), t.getMaxAttempts())) {
+                long backoff = retryPolicy.backoffMs(t.getAttempts());
+                recovered = tasks.scheduleRetry(t.getId(), reason, backoff) == 1;
+                if (recovered) {
+                    events.record(t.getWorkflowRunId(), t.getId(), "task_recovered",
+                            Map.of("task", t.getTaskKey(), "action", "retry", "backoff_ms", backoff));
+                }
+            } else {
+                recovered = tasks.failTerminal(t.getId(), reason + "; attempts exhausted") == 1;
+                if (recovered) {
+                    events.record(t.getWorkflowRunId(), t.getId(), "task_recovered",
+                            Map.of("task", t.getTaskKey(), "action", "failed"));
+                }
             }
-        } else if (tasks.failTerminal(t.getId(), reason + "; attempts exhausted") == 1) {
-            events.record(t.getWorkflowRunId(), t.getId(), "task_recovered",
-                    Map.of("task", t.getTaskKey(), "action", "failed"));
         }
-        counters.inc("tasks_recovered");
+        if (recovered) counters.inc("tasks_recovered");
+        return recovered;
     }
 }

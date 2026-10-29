@@ -26,10 +26,12 @@ public interface TaskRunRepository extends JpaRepository<TaskRunEntity, UUID> {
     @Query(value = "UPDATE task_runs SET status='ready' WHERE id=:id AND status='pending'", nativeQuery = true)
     int markReady(UUID id);
 
-    /** ready -> running. Increments attempts on dispatch. */
+    /** ready -> running. Increments attempts on dispatch. Refused once the run is no longer running. */
     @Modifying(clearAutomatically = true, flushAutomatically = true)
-    @Query(value = "UPDATE task_runs SET status='running', attempts=attempts+1, started_at=now(), finished_at=NULL "
-            + "WHERE id=:id AND status='ready' AND (next_run_at IS NULL OR next_run_at <= now())", nativeQuery = true)
+    @Query(value = "UPDATE task_runs t SET status='running', attempts=attempts+1, started_at=now(), finished_at=NULL "
+            + "WHERE t.id=:id AND t.status='ready' AND (t.next_run_at IS NULL OR t.next_run_at <= now()) "
+            + "AND EXISTS (SELECT 1 FROM workflow_runs r WHERE r.id = t.workflow_run_id AND r.status = 'running')",
+            nativeQuery = true)
     int claim(UUID id);
 
     @Modifying(clearAutomatically = true, flushAutomatically = true)

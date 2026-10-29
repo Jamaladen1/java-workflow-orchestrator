@@ -24,9 +24,12 @@ public class ApiKeyFilter extends OncePerRequestFilter {
 
     @Override
     protected boolean shouldNotFilter(HttpServletRequest req) {
-        return key.length == 0 || !req.getRequestURI().startsWith("/api/")
+        // The decoded, ';'-parameter-free path that request mapping uses; getRequestURI() is raw and
+        // would let "/api;x=1/..." or "/%61pi/..." through.
+        String path = req.getServletPath() + (req.getPathInfo() == null ? "" : req.getPathInfo());
+        return key.length == 0 || !path.startsWith("/api/")
                 || req.getMethod().equals("GET") || req.getMethod().equals("OPTIONS")
-                || req.getRequestURI().equals("/api/workflows/validate");
+                || path.equals("/api/workflows/validate");
     }
 
     @Override

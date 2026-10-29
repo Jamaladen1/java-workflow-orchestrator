@@ -28,6 +28,7 @@ spring:
 orchestrator:
   max-concurrent-tasks: ${MAX_CONCURRENT_TASKS:4}
   tick-interval-ms: ${SCHEDULER_TICK_MS:200}
+  orphan-sweep-interval-ms: ${ORPHAN_SWEEP_MS:15000}
   retry-base-ms: ${RETRY_BASE_MS:2000}
   retry-max-ms: ${RETRY_MAX_MS:60000}
   api-key: ${API_KEY:}
