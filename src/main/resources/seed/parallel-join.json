@@ -1,0 +1,10 @@
+{
+  "name": "parallel-join",
+  "tasks": [
+    {"id": "extract", "type": "delay", "config": {"duration_ms": 800}, "depends_on": []},
+    {"id": "enrich_users", "type": "delay", "config": {"duration_ms": 2500}, "depends_on": ["extract"]},
+    {"id": "enrich_orders", "type": "http", "config": {"status": 200, "delay_ms": 2000}, "depends_on": ["extract"]},
+    {"id": "join", "type": "math", "config": {"operation": "sum", "values": [2, 3]}, "depends_on": ["enrich_users", "enrich_orders"]},
+    {"id": "publish", "type": "transform", "config": {"operation": "upper", "input": "report ready"}, "depends_on": ["join"]}
+  ]
+}

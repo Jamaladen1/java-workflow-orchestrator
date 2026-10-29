@@ -1,0 +1,9 @@
+{
+  "name": "retry-demo",
+  "tasks": [
+    {"id": "validate", "type": "delay", "config": {"duration_ms": 500}, "depends_on": []},
+    {"id": "flaky_charge", "type": "delay", "config": {"duration_ms": 700, "fail_until_attempt": 3}, "max_attempts": 3, "depends_on": ["validate"]},
+    {"id": "audit_log", "type": "delay", "config": {"duration_ms": 1500}, "depends_on": ["validate"]},
+    {"id": "notify", "type": "transform", "config": {"operation": "upper", "input": "payment captured"}, "depends_on": ["flaky_charge", "audit_log"]}
+  ]
+}

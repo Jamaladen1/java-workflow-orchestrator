@@ -1,0 +1,10 @@
+{
+  "name": "fail-fast",
+  "tasks": [
+    {"id": "start", "type": "delay", "config": {"duration_ms": 300}, "depends_on": []},
+    {"id": "always_fails", "type": "delay", "config": {"duration_ms": 600, "fail_until_attempt": 10}, "max_attempts": 2, "depends_on": ["start"]},
+    {"id": "slow_branch", "type": "delay", "config": {"duration_ms": 5000}, "depends_on": ["start"]},
+    {"id": "join", "type": "math", "config": {"operation": "sum", "values": [1, 2]}, "depends_on": ["always_fails", "slow_branch"]},
+    {"id": "report", "type": "transform", "config": {"operation": "upper", "input": "never runs"}, "depends_on": ["join"]}
+  ]
+}

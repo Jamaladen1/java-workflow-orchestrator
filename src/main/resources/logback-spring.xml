@@ -1,0 +1,14 @@
+<configuration>
+  <springProperty name="appName" source="spring.application.name"/>
+  <appender name="JSON" class="ch.qos.logback.core.ConsoleAppender">
+    <encoder class="net.logstash.logback.encoder.LogstashEncoder">
+      <customFields>{"service":"${appName}"}</customFields>
+      <includeMdcKeyName>request_id</includeMdcKeyName>
+      <includeMdcKeyName>run_id</includeMdcKeyName>
+      <includeMdcKeyName>task_key</includeMdcKeyName>
+    </encoder>
+  </appender>
+  <root level="INFO"><appender-ref ref="JSON"/></root>
+  <logger name="org.testcontainers" level="WARN"/>
+  <logger name="com.github.dockerjava" level="WARN"/>
+</configuration>

@@ -1,0 +1,35 @@
+server:
+  port: ${PORT:8090}
+  shutdown: graceful
+
+spring:
+  application:
+    name: workflow-orchestrator
+  datasource:
+    url: ${DATABASE_URL:jdbc:postgresql://localhost:55433/orchestrator}
+    username: ${DATABASE_USER:orchestrator}
+    password: ${DATABASE_PASSWORD:orchestrator}
+    hikari:
+      maximum-pool-size: 10
+  jpa:
+    open-in-view: false
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate.jdbc.time_zone: UTC
+  flyway:
+    enabled: true
+  jackson:
+    property-naming-strategy: SNAKE_CASE
+    default-property-inclusion: always
+    serialization:
+      write-dates-as-timestamps: false
+
+orchestrator:
+  max-concurrent-tasks: ${MAX_CONCURRENT_TASKS:4}
+  tick-interval-ms: ${SCHEDULER_TICK_MS:200}
+  retry-base-ms: ${RETRY_BASE_MS:2000}
+  retry-max-ms: ${RETRY_MAX_MS:60000}
+  api-key: ${API_KEY:}
+  seed-demo-data: ${SEED_DEMO_DATA:true}
+  max-definition-bytes: 65536

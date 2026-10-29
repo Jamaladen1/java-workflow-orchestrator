@@ -1,0 +1,45 @@
+name: javaorchestrator
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: orchestrator
+      POSTGRES_USER: ${DATABASE_USER:-orchestrator}
+      POSTGRES_PASSWORD: ${DATABASE_PASSWORD:-orchestrator}
+    ports:
+      - "55433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d orchestrator"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  app:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: jdbc:postgresql://postgres:5432/orchestrator
+      DATABASE_USER: ${DATABASE_USER:-orchestrator}
+      DATABASE_PASSWORD: ${DATABASE_PASSWORD:-orchestrator}
+      PORT: 8090
+      MAX_CONCURRENT_TASKS: ${MAX_CONCURRENT_TASKS:-4}
+      RETRY_BASE_MS: ${RETRY_BASE_MS:-2000}
+      API_KEY: ${API_KEY:-}
+      SEED_DEMO_DATA: ${SEED_DEMO_DATA:-true}
+    ports:
+      - "8090:8090"
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/127.0.0.1/8090 && printf \"GET /health/ready HTTP/1.0\\r\\n\\r\\n\" >&3 && head -1 <&3 | grep -q 200'"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+      start_period: 20s
+    restart: unless-stopped
+
+volumes:
+  pgdata:
